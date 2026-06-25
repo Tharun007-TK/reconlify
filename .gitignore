@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+
+# Node
+node_modules/
+dist/
+.next/
+out/
+build/
+.pnpm-store/
+
+# IDE / OS
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+
+# Recko specific
+backend/.venv/
+backend/venv/
+backend/.env
+recko-frontend/node_modules/
+recko-frontend/.next/
