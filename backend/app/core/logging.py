@@ -38,13 +38,13 @@ def configure_logging() -> None:
         ]
 
     structlog.configure(
-        processors=processors,
-        wrapper_class=structlog.make_filtering_bound_logger(
-            logging.getLevelName(settings.LOG_LEVEL)
-        ),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
-        cache_logger_on_first_use=True,
-    )
+    processors=processors,
+    wrapper_class=structlog.make_filtering_bound_logger(
+        logging.getLevelName(settings.LOG_LEVEL)
+    ),
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    cache_logger_on_first_use=True,
+)
 
     # Route stdlib logging through structlog
     logging.basicConfig(

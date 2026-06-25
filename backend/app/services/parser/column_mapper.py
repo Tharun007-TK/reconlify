@@ -232,3 +232,5 @@ def apply_mapping(
         for raw, result in mapping.items()
         if result.method != "unmapped"
     }
+    
+ColumnMapping = MappingResult
