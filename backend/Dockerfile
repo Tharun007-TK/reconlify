@@ -4,7 +4,6 @@ FROM python:3.12-slim AS base
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     gcc \
-    curl \
     libcairo2 \
     libpango-1.0-0 \
     libpangocairo-1.0-0 \
@@ -14,8 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Reconlify CLI
-# RUN curl -sSL https://install.reconlify.io | bash
-# Uncomment ↑ once you have a valid Reconlify distribution URL.
+RUN pip install --no-cache-dir reconlify-cli
 
 WORKDIR /app
 

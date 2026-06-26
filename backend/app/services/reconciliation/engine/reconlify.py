@@ -13,14 +13,17 @@ import io
 import json
 import os
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, ClassVar
 
 import pandas as pd
 import structlog
+import yaml
 
 from app.config import settings
+from app.services.reconciliation.config_builder import build_recon_config, write_config as write_recon_config
 from app.services.reconciliation.engine.base import (
     BaseReconciliationEngine,
     ReconciliationEngineError,
@@ -76,8 +79,19 @@ class ReconlifyEngine(BaseReconciliationEngine):
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
-    def _work_dir(self, run_id: str) -> Path:
-        return self._tmp_dir / run_id
+    def _make_work_dir(self) -> Path:
+        """
+        Create an isolated temp directory under the configured base path.
+
+        Uses tempfile.mkdtemp() so each run gets a unique directory name
+        (e.g. /tmp/reconlify/tmp8x3kq2/) rather than a predictable path
+        derived from the run_id, which avoids any race condition when two
+        runs execute concurrently.
+
+        The base directory is created if it does not yet exist.
+        """
+        self._tmp_dir.mkdir(parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(dir=self._tmp_dir))
 
     @staticmethod
     def _records_to_csv(records: list[InvoiceRecord], path: Path) -> None:
@@ -299,17 +313,31 @@ class ReconlifyEngine(BaseReconciliationEngine):
     async def _execute_cli(
         self, work_dir: Path, pr_csv: Path, gstr2b_csv: Path, out_dir: Path
     ) -> tuple[str, float]:
-        """Run the Reconlify CLI and return (detected_version, duration_seconds)."""
+        """Write a YAML config and run `reconlify run config.yaml --out report.json`.
 
+        Exit-code contract:
+          0  → all records matched (success)
+          1  → differences found  (success — result file still written)
+          2  → unrecoverable error (raise ReconciliationEngineError)
+        """
+        config_path = work_dir / "config.yaml"
+        report_path = out_dir / "report.json"
+
+        # ── Build and write config.yaml via config_builder ──────────────────
+        recon_cfg = build_recon_config(pr_csv, gstr2b_csv)
+        config_path = write_recon_config(
+            recon_cfg,
+            work_dir / "config.yaml",
+            pr_csv=pr_csv,
+            gstr2b_csv=gstr2b_csv,
+        )
+
+        # ── Build CLI invocation ─────────────────────────────────────────────
         cli_args = [
             self._cli_path,
-            "recon",
-            "--pr",     str(pr_csv),
-            "--gstr2b", str(gstr2b_csv),
-            "--out",    str(out_dir),
-            "--format", "csv",
-            "--match-threshold", "0.88",
-            "--emit-potential",
+            "run",
+            str(config_path),
+            "--out", str(report_path),
         ]
         if settings.RECONLIFY_LICENSE_KEY:
             cli_args += ["--license", settings.RECONLIFY_LICENSE_KEY]
@@ -337,15 +365,30 @@ class ReconlifyEngine(BaseReconciliationEngine):
             ) from exc
 
         duration = round(time.perf_counter() - start, 3)
+        returncode = proc.returncode
 
-        if proc.returncode != 0:
+        # 0 → perfect match, 1 → differences found — both are valid outcomes
+        if returncode == 2:
             stderr_text = stderr.decode(errors="replace")[:1000]
             raise ReconciliationEngineError(
-                f"CLI exited with code {proc.returncode}: {stderr_text}",
+                f"CLI exited with error (code 2): {stderr_text}",
+                engine=self.ENGINE_NAME,
+            )
+        if returncode not in (0, 1):
+            stderr_text = stderr.decode(errors="replace")[:1000]
+            raise ReconciliationEngineError(
+                f"CLI exited with unexpected code {returncode}: {stderr_text}",
                 engine=self.ENGINE_NAME,
             )
 
-        # Extract version from stdout
+        logger.debug(
+            "reconlify.cli_complete",
+            returncode=returncode,
+            duration_seconds=duration,
+            matched_perfectly=(returncode == 0),
+        )
+
+        # Extract version from stdout (best-effort)
         version = self.ENGINE_VERSION
         for line in stdout.decode(errors="replace").splitlines():
             if "version" in line.lower():
@@ -357,9 +400,10 @@ class ReconlifyEngine(BaseReconciliationEngine):
     # ── Main entry point ──────────────────────────────────────────────────────
 
     async def reconcile(self, inp: ReconInput) -> ReconOutput:
-        run_id    = inp.run_id
-        work_dir  = self._work_dir(run_id)
-        out_dir   = work_dir / "output"
+        run_id  = inp.run_id
+        # Each run gets its own isolated temp directory under /tmp/reconlify/
+        work_dir = self._make_work_dir()
+        out_dir  = work_dir / "output"
 
         logger.info(
             "reconlify.start",
@@ -383,11 +427,26 @@ class ReconlifyEngine(BaseReconciliationEngine):
             # Execute CLI
             version, duration = await self._execute_cli(work_dir, pr_csv, gstr2b_csv, out_dir)
 
-            # Read output CSVs
-            matched_rows  = await loop.run_in_executor(None, self._read_csv_safe, out_dir / "matched.csv")
-            unmatched_pr  = await loop.run_in_executor(None, self._read_csv_safe, out_dir / "unmatched_pr.csv")
-            unmatched_2b  = await loop.run_in_executor(None, self._read_csv_safe, out_dir / "unmatched_2b.csv")
-            potential_rows = await loop.run_in_executor(None, self._read_csv_safe, out_dir / "potential.csv")
+            # Read report.json written by `reconlify run`
+            report_path = out_dir / "report.json"
+
+            def _load_report() -> dict[str, Any]:
+                if not report_path.exists() or report_path.stat().st_size == 0:
+                    logger.warning("reconlify.report_missing", path=str(report_path))
+                    return {}
+                try:
+                    return json.loads(report_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as exc:
+                    logger.warning("reconlify.report_parse_error", error=str(exc))
+                    return {}
+
+            report: dict[str, Any] = await loop.run_in_executor(None, _load_report)
+
+            # Extract row lists from the JSON report sections
+            matched_rows   = report.get("matched",       [])
+            unmatched_pr   = report.get("unmatched_source", [])   # source == PR
+            unmatched_2b   = report.get("unmatched_target", [])   # target == GSTR-2B
+            potential_rows = report.get("potential",     [])
 
             # Build indexes for enrichment
             pr_index = self._build_pr_index(inp.pr_records)

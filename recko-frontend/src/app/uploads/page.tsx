@@ -177,30 +177,59 @@ export default function UploadsPage() {
     setUploadProgress(0);
     setUploadResult(null);
 
-    const formData = new FormData();
-    formData.append("purchase_register", data.purchase_register);
-    formData.append("gstr2b", data.gstr2b);
+    // Generate a temporary project ID for the session
+    const projectId = crypto.randomUUID();
 
     try {
-      const response = await axios.post("http://localhost:8000/api/v1/upload", formData, {
-        headers: {
-          "Content-Type": "multipart/form-data",
-        },
+      // 1. Upload Purchase Register
+      const prFormData = new FormData();
+      prFormData.append("project_id", projectId);
+      prFormData.append("file_type", "purchase_register");
+      prFormData.append("file", data.purchase_register);
+
+      const prResponse = await axios.post("http://localhost:8000/api/v1/upload/direct", prFormData, {
+        headers: { "Content-Type": "multipart/form-data" },
         onUploadProgress: (progressEvent) => {
           if (progressEvent.total) {
-            const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
-            setUploadProgress(percentCompleted);
+            setUploadProgress(Math.round((progressEvent.loaded * 40) / progressEvent.total));
           }
         },
+      });
+      const uploadPrId = prResponse.data.upload_id;
+
+      // 2. Upload GSTR-2B
+      const g2bFormData = new FormData();
+      g2bFormData.append("project_id", projectId);
+      g2bFormData.append("file_type", "gstr_2b");
+      g2bFormData.append("file", data.gstr2b);
+
+      const g2bResponse = await axios.post("http://localhost:8000/api/v1/upload/direct", g2bFormData, {
+        headers: { "Content-Type": "multipart/form-data" },
+        onUploadProgress: (progressEvent) => {
+          if (progressEvent.total) {
+            setUploadProgress(40 + Math.round((progressEvent.loaded * 40) / progressEvent.total));
+          }
+        },
+      });
+      const upload2bId = g2bResponse.data.upload_id;
+
+      setUploadProgress(90);
+
+      // 3. Confirm Uploads
+      const confirmResponse = await axios.post("http://localhost:8000/api/v1/upload/confirm", {
+        project_id: projectId,
+        upload_pr_id: uploadPrId,
+        upload_2b_id: upload2bId,
+        run_config: {}
       });
 
       setUploadResult({
         success: true,
-        message: "Files uploaded successfully! Reconciliation has been queued.",
-        details: response.data,
+        message: confirmResponse.data.message || "Files uploaded successfully! Reconciliation has been queued.",
+        details: confirmResponse.data,
       });
-      // Optionally reset form after success
-      // reset(); 
+      setUploadProgress(100);
+
     } catch (error: any) {
       console.error("Upload failed:", error);
       setUploadResult({
@@ -209,7 +238,6 @@ export default function UploadsPage() {
       });
     } finally {
       setIsUploading(false);
-      setUploadProgress(100);
     }
   };
 
